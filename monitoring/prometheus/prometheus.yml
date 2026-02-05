@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'orchestrator'
+    static_configs:
+      - targets: ['orchestrator:9090']
+        labels:
+          service: 'orchestrator'
+  
+  - job_name: 'sentinel'
+    static_configs:
+      - targets: ['host.docker.internal:9091']
+        labels:
+          service: 'sentinel'
+  
+  - job_name: 'memory'
+    static_configs:
+      - targets: ['memory:9092']
+        labels:
+          service: 'memory'

@@ -1,0 +1,46 @@
+[
+  {
+    "collection": "knowledge",
+    "content": "High CPU usage by unknown processes often indicates malware or crypto miners. Recommended action is to suspend the process and ask the user.",
+    "metadata": {
+      "category": "security",
+      "metric": "cpu",
+      "threshold": "90%",
+      "heuristic_id": "h_cpu_01"
+    },
+    "importance": 8
+  },
+  {
+    "collection": "knowledge",
+    "content": "If VRAM is full and a high-priority image generation task arrives, the system should hibernate the LLM service to free up resources.",
+    "metadata": {
+      "category": "resource_management",
+      "metric": "vram",
+      "action": "swap",
+      "heuristic_id": "h_vram_01"
+    },
+    "importance": 9
+  },
+  {
+    "collection": "knowledge",
+    "content": "Ollama service requires approximately 6GB VRAM for Llama3-8b. Do not attempt to load if available VRAM is below this threshold.",
+    "metadata": {
+      "category": "resource_limits",
+      "service": "ollama",
+      "heuristic_id": "h_res_01"
+    },
+    "importance": 7
+  },
+  {
+    "collection": "decisions",
+    "content": "Action: block_process\nContext: {\"process_name\": \"xmrig.exe\", \"cpu_usage\": 98}\nUser Approved: true\nAuto Approved: true",
+    "metadata": {
+      "action": "block_process",
+      "context": {"process_name": "xmrig.exe", "cpu_usage": 98},
+      "user_approved": true,
+      "auto_approved": true,
+      "outcome": "Threat mitigated"
+    },
+    "importance": 10
+  }
+]

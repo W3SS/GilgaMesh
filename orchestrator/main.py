@@ -1,0 +1,926 @@
+"""
+PROMETHEUS MESH - Resource Orchestrator
+Gerencia ciclo de vida de containers Docker com otimização de VRAM
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+from collections import deque
+import json
+import os
+
+import docker
+from docker.errors import NotFound, APIError
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+
+# ============================================================================
+# CONFIGURAÇÃO E LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("PrometheusOrchestrator")
+
+# Métricas Prometheus
+TASK_COUNTER = Counter('prometheus_tasks_total', 'Total de tarefas processadas', ['type', 'status'])
+SWAP_DURATION = Histogram('prometheus_swap_seconds', 'Tempo de swap de contexto')
+VRAM_USAGE = Gauge('prometheus_vram_mb', 'Uso estimado de VRAM', ['service'])
+QUEUE_SIZE = Gauge('prometheus_queue_size', 'Tamanho da fila de tarefas')
+
+# ============================================================================
+# ENUMS E CONSTANTES
+# ============================================================================
+
+class ServiceState(str, Enum):
+    """Estados possíveis de cada serviço"""
+    STOPPED = "stopped"
+    STARTING = "starting"
+    READY = "ready"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+class TaskType(str, Enum):
+    """Tipos de tarefas que o orquestrador processa"""
+    TEXT_GENERATION = "text"
+    IMAGE_GENERATION = "image"
+    AUDIO_GENERATION = "audio"
+    VIDEO_GENERATION = "video"
+    TRANSCRIPTION = "transcription"
+    SYSTEM_COMMAND = "system"
+
+class Priority(int, Enum):
+    """Prioridade de execução"""
+    CRITICAL = 0  # Comandos de segurança
+    HIGH = 1      # Tarefas do usuário diretas
+    MEDIUM = 2    # Gerações criativas
+    LOW = 3       # Background tasks
+
+class ContextMode(str, Enum):
+    """Modos de operação do sistema"""
+    TEXT_HEAVY = "text_heavy"      # Ollama ativo, ComfyUI standby
+    CREATIVE = "creative"           # ComfyUI ativo, Ollama standby
+    AUDIO_PROCESSING = "audio"      # Whisper/TTS ativos
+    HYBRID = "hybrid"               # Múltiplos serviços (usar com cautela)
+
+# Configurações de VRAM (MB)
+VRAM_LIMITS = {
+    "ollama_llama3_8b": 6000,
+    "ollama_llama3_70b": 40000,  # Não cabe na 4070!
+    "comfyui_sdxl": 8500,
+    "comfyui_flux": 10000,
+    "whisper_large": 3000,
+    "whisper_medium": 1500,
+}
+
+VRAM_TOTAL = 12000  # RTX 4070 Super
+VRAM_SAFETY_MARGIN = 1000  # Margem de segurança
+
+# ============================================================================
+# MODELOS DE DADOS
+# ============================================================================
+
+class TaskRequest(BaseModel):
+    """Requisição de tarefa"""
+    type: TaskType
+    prompt: str
+    priority: Priority = Priority.MEDIUM
+    parameters: Dict[str, Any] = {}
+    user_id: Optional[str] = None
+    timeout: int = 300  # segundos
+
+class TaskResponse(BaseModel):
+    """Resposta de tarefa"""
+    task_id: str
+    status: str
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    execution_time: float
+    vram_used: int
+
+@dataclass
+class Task:
+    """Tarefa interna do orquestrador"""
+    id: str
+    type: TaskType
+    prompt: str
+    priority: Priority
+    parameters: Dict[str, Any]
+    created_at: datetime = field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    
+    def __lt__(self, other):
+        """Para ordenação na fila de prioridade"""
+        if self.priority != other.priority:
+            return self.priority.value < other.priority.value
+        return self.created_at < other.created_at
+
+@dataclass
+class ServiceHealth:
+    """Estado de saúde de um serviço"""
+    name: str
+    state: ServiceState
+    vram_allocated: int
+    last_used: datetime
+    error_count: int = 0
+    url: Optional[str] = None
+
+# ============================================================================
+# ORQUESTRADOR PRINCIPAL
+# ============================================================================
+
+class PrometheusOrchestrator:
+    """
+    Orquestrador central que gerencia:
+    - Fila de tarefas com priorização
+    - Swap inteligente de containers
+    - Monitoramento de VRAM
+    - Healthchecks e recuperação de falhas
+    """
+    
+    def __init__(self):
+        self.docker_client = docker.from_env()
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+        
+        # Estado do sistema
+        self.current_mode: ContextMode = ContextMode.TEXT_HEAVY
+        self.services: Dict[str, ServiceHealth] = {}
+        self.task_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self.active_tasks: Dict[str, Task] = {}
+        self.history: deque = deque(maxlen=100)
+        
+        # Locks para evitar race conditions
+        self.swap_lock = asyncio.Lock()
+        self.vram_lock = asyncio.Lock()
+        
+        # Worker de processamento
+        self.worker_task: Optional[asyncio.Task] = None
+        self.is_running = False
+        
+        # Cache de decisões preditivas
+        self.last_user_prompts: deque = deque(maxlen=10)
+        self.predicted_next_mode: Optional[ContextMode] = None
+        
+        # Service URLs from Env
+        self.ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+        self.comfyui_url = os.getenv("COMFYUI_URL", "http://comfyui:8188")
+        self.whisper_url = os.getenv("WHISPER_URL", "http://whisper:9000")
+        self.notifications_url = os.getenv("NOTIFICATIONS_URL", "http://notifications:9003")
+        
+        logger.info("🚀 Prometheus Orchestrator initialized")
+
+    async def notify(self, title: str, message: str, priority: str = "normal", channel: str = "discord"):
+        """Envia notificação via serviço de notificações"""
+        try:
+            payload = {
+                "channel": channel,
+                "title": title,
+                "message": message,
+                "priority": priority,
+                "metadata": {
+                    "source": "orchestrator",
+                    "mode": self.current_mode,
+                    "vram_usage": self._get_current_vram_usage()
+                }
+            }
+            await self.http_client.post(f"{self.notifications_url}/notify", json=payload)
+        except Exception as e:
+            logger.warning(f"Failed to send notification: {e}")
+    
+    # ========================================================================
+    # INICIALIZAÇÃO E LIFECYCLE
+    # ========================================================================
+    
+    async def start(self):
+        """Inicia o orquestrador"""
+        logger.info("Starting Prometheus Orchestrator...")
+        
+        # Descobre containers disponíveis
+        await self._discover_services()
+        
+        # Inicia no modo texto (padrão)
+        await self.transition_to(ContextMode.TEXT_HEAVY)
+        
+        # Inicia worker de processamento
+        self.is_running = True
+        self.worker_task = asyncio.create_task(self._task_worker())
+        
+        # Inicia healthcheck periódico
+        asyncio.create_task(self._healthcheck_loop())
+        
+        # Inicia predição de contexto
+        asyncio.create_task(self._predictive_warmup_loop())
+        
+        logger.info("✅ Orchestrator ready")
+    
+    async def shutdown(self):
+        """Desliga gracefully"""
+        logger.info("Shutting down orchestrator...")
+        self.is_running = False
+        
+        if self.worker_task:
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Aguarda fila esvaziar (máx 30s)
+        try:
+            await asyncio.wait_for(self.task_queue.join(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("Queue did not empty in time")
+        
+        await self.http_client.aclose()
+        logger.info("👋 Orchestrator stopped")
+    
+    async def _discover_services(self):
+        """Descobre e registra containers Docker disponíveis"""
+        try:
+            # We map container names (or service names) to internal configs
+            # Assuming container names are prefixed with 'prometheus-' based on docker-compose
+            # or just rely on service names if using internal docker DNS
+            
+            service_map = {
+                "ollama": {"url": self.ollama_url, "vram": 6000, "container": "prometheus-ollama"},
+                "comfyui": {"url": self.comfyui_url, "vram": 8500, "container": "prometheus-comfyui"},
+                "whisper": {"url": self.whisper_url, "vram": 1500, "container": "prometheus-whisper"},
+            }
+            
+            for name, config in service_map.items():
+                try:
+                    # Check if container exists/is running via docker client
+                    # We utilize the container name defined in docker-compose
+                    container = self.docker_client.containers.get(config["container"])
+                    state = ServiceState.READY if container.status == "running" else ServiceState.STOPPED
+                    
+                    self.services[name] = ServiceHealth(
+                        name=name,
+                        state=state,
+                        vram_allocated=0 if state == ServiceState.STOPPED else config["vram"],
+                        last_used=datetime.now(),
+                        url=config["url"]
+                    )
+                    
+                    VRAM_USAGE.labels(service=name).set(self.services[name].vram_allocated)
+                    logger.info(f"Discovered service: {name} (state: {state})")
+                except NotFound:
+                    logger.warning(f"Service container {config['container']} not found")
+        
+        except Exception as e:
+            logger.error(f"Error discovering services: {e}")
+    
+    # ========================================================================
+    # GERENCIAMENTO DE TAREFAS
+    # ========================================================================
+    
+    async def submit_task(self, request: TaskRequest) -> str:
+        """Submete uma tarefa para processamento"""
+        task = Task(
+            id=f"task_{datetime.now().timestamp()}",
+            type=request.type,
+            prompt=request.prompt,
+            priority=request.priority,
+            parameters=request.parameters
+        )
+        
+        await self.task_queue.put((task.priority.value, task))
+        QUEUE_SIZE.set(self.task_queue.qsize())
+        
+        self.active_tasks[task.id] = task
+        logger.info(f"📝 Task submitted: {task.id} (type: {task.type}, priority: {task.priority})")
+        
+        # Atualiza histórico para predição
+        self.last_user_prompts.append({
+            "type": task.type,
+            "keywords": self._extract_keywords(request.prompt),
+            "timestamp": datetime.now()
+        })
+        
+        return task.id
+    
+    async def get_task_status(self, task_id: str) -> Optional[TaskResponse]:
+        """Consulta status de uma tarefa"""
+        if task_id not in self.active_tasks:
+            return None
+        
+        task = self.active_tasks[task_id]
+        
+        status = "pending"
+        if task.completed_at:
+            status = "completed" if not task.error else "failed"
+        elif task.started_at:
+            status = "running"
+        
+        execution_time = 0.0
+        if task.started_at:
+            end = task.completed_at or datetime.now()
+            execution_time = (end - task.started_at).total_seconds()
+        
+        return TaskResponse(
+            task_id=task.id,
+            status=status,
+            result=task.result,
+            error=task.error,
+            execution_time=execution_time,
+            vram_used=self._get_current_vram_usage()
+        )
+    
+    async def _task_worker(self):
+        """Worker que processa tarefas da fila"""
+        logger.info("🔄 Task worker started")
+        
+        while self.is_running:
+            try:
+                # Pega próxima tarefa (bloqueante com timeout)
+                try:
+                    _, task = await asyncio.wait_for(
+                        self.task_queue.get(),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                
+                QUEUE_SIZE.set(self.task_queue.qsize())
+                
+                # Processa tarefa
+                task.started_at = datetime.now()
+                logger.info(f"▶️  Processing task: {task.id}")
+                
+                try:
+                    result = await self._execute_task(task)
+                    task.result = result
+                    task.completed_at = datetime.now()
+                    
+                    TASK_COUNTER.labels(type=task.type, status="success").inc()
+                    logger.info(f"✅ Task completed: {task.id}")
+                    
+                    # Notify
+                    await self.notify(
+                        title=f"Task Completed: {task.type}",
+                        message=f"Task {task.id} finished successfully in {(task.completed_at - task.started_at).total_seconds():.1f}s",
+                        priority="normal"
+                    )
+                
+                except Exception as e:
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+                    
+                    TASK_COUNTER.labels(type=task.type, status="error").inc()
+                    logger.error(f"❌ Task failed: {task.id} - {e}")
+                    
+                    # Notify Error
+                    await self.notify(
+                        title=f"Task Failed: {task.type}",
+                        message=f"Task {task.id} failed: {e}",
+                        priority="high"
+                    )
+                
+                finally:
+                    self.task_queue.task_done()
+                    self.history.append(task)
+            
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+                await asyncio.sleep(1)
+    
+    async def _execute_task(self, task: Task) -> Any:
+        """Executa uma tarefa específica"""
+        # Determina modo necessário
+        required_mode = self._get_required_mode(task.type)
+        
+        # Faz swap se necessário
+        if self.current_mode != required_mode:
+            await self.transition_to(required_mode)
+        
+        # Delega para executor específico
+        if task.type == TaskType.TEXT_GENERATION:
+            return await self._execute_text_generation(task)
+        
+        elif task.type == TaskType.IMAGE_GENERATION:
+            return await self._execute_image_generation(task)
+        
+        elif task.type == TaskType.TRANSCRIPTION:
+            return await self._execute_transcription(task)
+        
+        elif task.type == TaskType.SYSTEM_COMMAND:
+            return await self._execute_system_command(task)
+        
+        else:
+            raise NotImplementedError(f"Task type {task.type} not implemented")
+    
+    # ========================================================================
+    # EXECUTORES DE TAREFAS ESPECÍFICAS
+    # ========================================================================
+    
+    async def _execute_text_generation(self, task: Task) -> str:
+        """Executa geração de texto via Ollama"""
+        service = self.services.get("ollama")
+        if not service or service.state != ServiceState.READY:
+            raise RuntimeError("Ollama service not ready")
+        
+        payload = {
+            "model": task.parameters.get("model", "llama3.1:8b"),
+            "prompt": task.prompt,
+            "stream": False,
+            "options": {
+                "temperature": task.parameters.get("temperature", 0.7),
+                "num_ctx": task.parameters.get("context_length", 4096)
+            }
+        }
+        
+        try:
+            response = await self.http_client.post(
+                f"{service.url}/api/generate",
+                json=payload,
+                timeout=task.parameters.get("timeout", 120)
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            return result.get("response", "")
+        
+        except httpx.HTTPError as e:
+            logger.error(f"Ollama request failed: {e}")
+            raise
+    
+    async def _execute_image_generation(self, task: Task) -> Dict[str, Any]:
+        """Executa geração de imagem via ComfyUI"""
+        service = self.services.get("comfyui")
+        if not service or service.state != ServiceState.READY:
+            raise RuntimeError("ComfyUI service not ready")
+        
+        # Carrega workflow template
+        workflow_path = os.path.join(os.path.dirname(__file__), "..", "ai_services", "comfyui", "workflows", "default.json")
+        if not os.path.exists(workflow_path):
+            raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
+            
+        import json
+        with open(workflow_path, "r") as f:
+            workflow_str = f.read()
+            
+        # Parâmetros padrão
+        params = {
+            "prompt": task.prompt,
+            "negative_prompt": task.parameters.get("negative_prompt", "blur, low quality"),
+            "steps": task.parameters.get("steps", 20),
+            "cfg_scale": task.parameters.get("cfg", 7.0),
+            "width": task.parameters.get("width", 512),
+            "height": task.parameters.get("height", 512),
+            "seed": task.parameters.get("seed", 42) # Fixed seed default for testing
+        }
+        
+        # Substituição simples de template ({{key}})
+        for key, value in params.items():
+            workflow_str = workflow_str.replace(f"{{{{{key}}}}}", str(value))
+            
+        workflow = json.loads(workflow_str)
+        
+        try:
+            # Envia workflow para ComfyUI
+            response = await self.http_client.post(
+                f"{service.url}/prompt",
+                json={"prompt": workflow},
+                timeout=task.parameters.get("timeout", 300)
+            )
+            response.raise_for_status()
+            
+            prompt_id = response.json()["prompt_id"]
+            
+            # Aguarda conclusão (polling)
+            image_path = await self._wait_for_comfyui_result(prompt_id)
+            
+            return {
+                "prompt_id": prompt_id,
+                "image_path": image_path,
+                "workflow": workflow
+            }
+        
+        except httpx.HTTPError as e:
+            logger.error(f"ComfyUI request failed: {e}")
+            raise
+    
+    async def _wait_for_comfyui_result(self, prompt_id: str, max_wait: int = 300) -> str:
+        """Aguarda ComfyUI terminar de processar (polling)"""
+        service = self.services["comfyui"]
+        start_time = datetime.now()
+        
+        while (datetime.now() - start_time).total_seconds() < max_wait:
+            try:
+                response = await self.http_client.get(f"{service.url}/history/{prompt_id}")
+                history = response.json()
+                
+                if prompt_id in history:
+                    outputs = history[prompt_id].get("outputs", {})
+                    # Procura primeira imagem gerada
+                    for node_id, node_output in outputs.items():
+                        if "images" in node_output:
+                            image_info = node_output["images"][0]
+                            return f"/output/{image_info['filename']}"
+                
+                await asyncio.sleep(2)  # Polling a cada 2s
+            
+            except Exception as e:
+                logger.warning(f"Error polling ComfyUI: {e}")
+                await asyncio.sleep(2)
+        
+        raise TimeoutError(f"ComfyUI did not complete in {max_wait}s")
+    
+    async def _execute_transcription(self, task: Task) -> str:
+        """Executa transcrição de áudio via Whisper"""
+        service = self.services.get("whisper")
+        if not service or service.state != ServiceState.READY:
+            raise RuntimeError("Whisper service not ready")
+        
+        audio_file = task.parameters.get("audio_file")
+        if not audio_file:
+            raise ValueError("audio_file parameter required")
+        
+        # Implementação simplificada (em produção, enviaria arquivo)
+        return f"[Transcription placeholder for {audio_file}]"
+    
+    async def _execute_system_command(self, task: Task) -> Dict[str, Any]:
+        """Executa comandos de sistema (via Sentinel)"""
+        command = task.parameters.get("command")
+        
+        # Aqui chamaria a API do Sentinel
+        logger.info(f"Executing system command: {command}")
+        
+        return {"status": "executed", "command": command}
+    
+    # ========================================================================
+    # GERENCIAMENTO DE CONTEXTO E SWAP
+    # ========================================================================
+    
+    async def transition_to(self, target_mode: ContextMode):
+        """Faz transição entre modos operacionais"""
+        if self.current_mode == target_mode:
+            logger.debug(f"Already in mode {target_mode}")
+            return
+        
+        async with self.swap_lock:
+            logger.info(f"🔄 Transitioning: {self.current_mode} -> {target_mode}")
+            
+            with SWAP_DURATION.time():
+                try:
+                    if target_mode == ContextMode.TEXT_HEAVY:
+                        await self._activate_text_mode()
+                    
+                    elif target_mode == ContextMode.CREATIVE:
+                        await self._activate_creative_mode()
+                    
+                    elif target_mode == ContextMode.AUDIO_PROCESSING:
+                        await self._activate_audio_mode()
+                    
+                    self.current_mode = target_mode
+                    logger.info(f"✅ Transition complete: Now in {target_mode}")
+                    
+                    # Notify Transition
+                    await self.notify(
+                        title="Context Switched",
+                        message=f"System transitioned to {target_mode} mode",
+                        priority="low"
+                    )
+                
+                except Exception as e:
+                    logger.error(f"❌ Transition failed: {e}")
+                    raise
+    
+    async def _activate_text_mode(self):
+        """Ativa modo texto: Ollama ligado, ComfyUI desligado"""
+        # Para ComfyUI
+        await self._stop_service("comfyui")
+        
+        # Aguarda VRAM liberar
+        await asyncio.sleep(2)
+        
+        # Inicia Ollama
+        await self._start_service("ollama")
+        
+        # Aguarda carregar modelo
+        await self._wait_for_service_ready("ollama", max_wait=30)
+    
+    async def _activate_creative_mode(self):
+        """Ativa modo criativo: ComfyUI ligado, Ollama desligado"""
+        # Descarrega modelo do Ollama explicitamente
+        if self.services.get("ollama", {}).state == ServiceState.READY:
+            try:
+                # Força unload do modelo
+                await self.http_client.post(
+                    f"{self.services['ollama'].url}/api/generate",
+                    json={"model": "", "keep_alive": 0}
+                )
+            except:
+                pass
+        
+        await self._stop_service("ollama")
+        await asyncio.sleep(3)  # VRAM demora para liberar completamente
+        
+        await self._start_service("comfyui")
+        await self._wait_for_service_ready("comfyui", max_wait=60)
+    
+    async def _activate_audio_mode(self):
+        """Ativa modo áudio: Whisper ligado"""
+        await self._start_service("whisper")
+        await self._wait_for_service_ready("whisper", max_wait=20)
+    
+    # ========================================================================
+    # CONTROLE DE CONTAINERS DOCKER
+    # ========================================================================
+    
+    async def _start_service(self, service_name: str):
+        """Inicia um container Docker"""
+        if service_name not in self.services:
+            raise ValueError(f"Unknown service: {service_name}")
+        
+        service = self.services[service_name]
+        
+        if service.state == ServiceState.READY:
+            logger.debug(f"Service {service_name} already running")
+            return
+        
+        try:
+            # Map internal service name to container name
+            container_name = f"prometheus-{service_name}"
+            container = self.docker_client.containers.get(container_name)
+            
+            logger.info(f"Starting {service_name}...")
+            service.state = ServiceState.STARTING
+            
+            container.start()
+            
+            # Espera um pouco para o container inicializar
+            await asyncio.sleep(2)
+            
+            logger.info(f"✅ {service_name} started")
+        
+        except NotFound:
+            logger.error(f"Container {service_name} not found")
+            service.state = ServiceState.ERROR
+            raise
+        
+        except APIError as e:
+            logger.error(f"Failed to start {service_name}: {e}")
+            service.state = ServiceState.ERROR
+            raise
+    
+    async def _stop_service(self, service_name: str):
+        """Para um container Docker"""
+        if service_name not in self.services:
+            return
+        
+        service = self.services[service_name]
+        
+        if service.state == ServiceState.STOPPED:
+            return
+        
+        try:
+            container_name = f"prometheus-{service_name}"
+            container = self.docker_client.containers.get(container_name)
+            
+            logger.info(f"Stopping {service_name}...")
+            service.state = ServiceState.STOPPING
+            
+            container.stop(timeout=10)
+            
+            service.state = ServiceState.STOPPED
+            service.vram_allocated = 0
+            VRAM_USAGE.labels(service=service_name).set(0)
+            
+            logger.info(f"🛑 {service_name} stopped")
+        
+        except NotFound:
+            service.state = ServiceState.STOPPED
+        
+        except APIError as e:
+            logger.error(f"Failed to stop {service_name}: {e}")
+            raise
+    
+    async def _wait_for_service_ready(self, service_name: str, max_wait: int = 30):
+        """Aguarda serviço ficar pronto (healthcheck)"""
+        service = self.services[service_name]
+        start_time = datetime.now()
+        
+        while (datetime.now() - start_time).total_seconds() < max_wait:
+            try:
+                # Tenta ping no serviço
+                # Note: Ollama check is distinct
+                url = f"{service.url}/api/tags" if service_name == "ollama" else f"{service.url}/health"
+                if service_name == "whisper":
+                     url = f"{service.url}/" # Whisper container might just have root or docs
+                
+                # Simpler check for now: just root or specific known endpoints
+                if service_name == "comfyui":
+                    url = f"{service.url}/system_stats"
+                elif service_name == "whisper":
+                    url = f"{service.url}/params" # example
+
+                response = await self.http_client.get(
+                   url,
+                    timeout=5.0
+                )
+                
+                # Loose check: if we get a response, it's alive-ish
+                if response.status_code < 500:
+                    service.state = ServiceState.READY
+                    service.vram_allocated = VRAM_LIMITS.get(
+                        f"{service_name}_sdxl" if service_name == "comfyui" else f"{service_name}_llama3_8b",
+                        2000
+                    )
+                    VRAM_USAGE.labels(service=service_name).set(service.vram_allocated)
+                    logger.info(f"✅ {service_name} is ready")
+                    return
+            
+            except:
+                pass
+            
+            await asyncio.sleep(1)
+        
+        raise TimeoutError(f"{service_name} did not become ready in {max_wait}s")
+    
+    # ========================================================================
+    # HEALTHCHECK E PREDIÇÃO
+    # ========================================================================
+    
+    async def _healthcheck_loop(self):
+        """Loop de healthcheck periódico"""
+        while self.is_running:
+            try:
+                for service_name, service in self.services.items():
+                    if service.state == ServiceState.READY:
+                        try:
+                            # Simple ping
+                            response = await self.http_client.get(service.url, timeout=3.0)
+                            
+                            if response.status_code >= 500:
+                                logger.warning(f"⚠️  {service_name} healthcheck failed")
+                                service.error_count += 1
+                        
+                        except:
+                            service.error_count += 1
+                            
+                            if service.error_count > 3:
+                                logger.error(f"❌ {service_name} appears unhealthy")
+                                service.state = ServiceState.ERROR
+            
+            except Exception as e:
+                logger.error(f"Healthcheck error: {e}")
+            
+            await asyncio.sleep(30)  # Check a cada 30s
+    
+    async def _predictive_warmup_loop(self):
+        """Loop de aquecimento preditivo"""
+        while self.is_running:
+            try:
+                # Analisa últimas 10 requisições
+                if len(self.last_user_prompts) >= 3:
+                    recent_types = [p["type"] for p in list(self.last_user_prompts)[-3:]]
+                    
+                    # Se 2 das últimas 3 foram criativas, pré-aquece ComfyUI
+                    creative_count = sum(1 for t in recent_types if t in [
+                        TaskType.IMAGE_GENERATION,
+                        TaskType.VIDEO_GENERATION
+                    ])
+                    
+                    if creative_count >= 2 and self.current_mode != ContextMode.CREATIVE:
+                        logger.info("🔮 Predicting creative mode needed, pre-warming...")
+                        # Não faz swap completo, mas prepara
+                        self.predicted_next_mode = ContextMode.CREATIVE
+            
+            except Exception as e:
+                logger.error(f"Prediction error: {e}")
+            
+            await asyncio.sleep(10)
+    
+    # ========================================================================
+    # UTILITÁRIOS
+    # ========================================================================
+    
+    def _get_required_mode(self, task_type: TaskType) -> ContextMode:
+        """Determina modo necessário para um tipo de tarefa"""
+        if task_type == TaskType.TEXT_GENERATION:
+            return ContextMode.TEXT_HEAVY
+        
+        elif task_type in [TaskType.IMAGE_GENERATION, TaskType.VIDEO_GENERATION]:
+            return ContextMode.CREATIVE
+        
+        elif task_type in [TaskType.TRANSCRIPTION, TaskType.AUDIO_GENERATION]:
+            return ContextMode.AUDIO_PROCESSING
+        
+        else:
+            return ContextMode.TEXT_HEAVY
+    
+    def _get_current_vram_usage(self) -> int:
+        """Calcula uso atual de VRAM"""
+        total = sum(
+            service.vram_allocated 
+            for service in self.services.values() 
+            if service.state == ServiceState.READY
+        )
+        return total
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extrai keywords para predição (simplificado)"""
+        creative_keywords = ["imagem", "desenho", "foto", "arte", "vídeo", "generate", "create"]
+        return [kw for kw in creative_keywords if kw in text.lower()]
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Retorna status completo do orquestrador"""
+        return {
+            "mode": self.current_mode,
+            "queue_size": self.task_queue.qsize(),
+            "vram_usage": self._get_current_vram_usage(),
+            "vram_total": VRAM_TOTAL,
+            "services": {
+                name: {
+                    "state": service.state,
+                    "vram_mb": service.vram_allocated,
+                    "errors": service.error_count
+                }
+                for name, service in self.services.items()
+            },
+            "recent_tasks": len(self.history)
+        }
+
+# ============================================================================
+# API FASTAPI
+# ============================================================================
+
+app = FastAPI(title="Prometheus Orchestrator API")
+orchestrator = PrometheusOrchestrator()
+
+@app.on_event("startup")
+async def startup():
+    """Inicializa orquestrador ao subir API"""
+    # Inicia métricas Prometheus em porta separada
+    start_http_server(9090)
+    await orchestrator.start()
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Desliga gracefully"""
+    await orchestrator.shutdown()
+
+@app.post("/tasks", response_model=Dict[str, str])
+async def create_task(request: TaskRequest):
+    """
+    Submete uma nova tarefa
+    
+    Exemplo:
+    ```json
+    {
+      "type": "text",
+      "prompt": "Explique quantum computing",
+      "priority": "medium",
+      "parameters": {"temperature": 0.8}
+    }
+    ```
+    """
+    try:
+        task_id = await orchestrator.submit_task(request)
+        return {"task_id": task_id, "status": "queued"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(task_id: str):
+    """Consulta status de uma tarefa"""
+    result = await orchestrator.get_task_status(task_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+@app.get("/status")
+async def get_status():
+    """Retorna status completo do sistema"""
+    return await orchestrator.get_status()
+
+@app.post("/mode/{target_mode}")
+async def set_mode(target_mode: ContextMode, background_tasks: BackgroundTasks):
+    """Força transição de modo (para debug)"""
+    background_tasks.add_task(orchestrator.transition_to, target_mode)
+    return {"message": f"Transitioning to {target_mode}"}
+
+@app.get("/health")
+async def health():
+    """Healthcheck da API"""
+    return {"status": "healthy", "mode": orchestrator.current_mode}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
