@@ -20,6 +20,9 @@ from pydantic import BaseModel
 import httpx
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
+# Configuration
+from config.settings import settings
+
 # ============================================================================
 # CONFIGURAÇÃO E LOGGING
 # ============================================================================
@@ -71,18 +74,8 @@ class ContextMode(str, Enum):
     AUDIO_PROCESSING = "audio"      # Whisper/TTS ativos
     HYBRID = "hybrid"               # Múltiplos serviços (usar com cautela)
 
-# Configurações de VRAM (MB)
-VRAM_LIMITS = {
-    "ollama_llama3_8b": 6000,
-    "ollama_llama3_70b": 40000,  # Não cabe na 4070!
-    "comfyui_sdxl": 8500,
-    "comfyui_flux": 10000,
-    "whisper_large": 3000,
-    "whisper_medium": 1500,
-}
-
-VRAM_TOTAL = 12000  # RTX 4070 Super
-VRAM_SAFETY_MARGIN = 1000  # Margem de segurança
+# Configuration is now loaded from config/settings.py
+# Access via: settings.vram_limits, settings.vram_total, settings.vram_safety_margin
 
 # ============================================================================
 # MODELOS DE DADOS
@@ -172,11 +165,11 @@ class PrometheusOrchestrator:
         self.last_user_prompts: deque = deque(maxlen=10)
         self.predicted_next_mode: Optional[ContextMode] = None
         
-        # Service URLs from Env
-        self.ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-        self.comfyui_url = os.getenv("COMFYUI_URL", "http://comfyui:8188")
-        self.whisper_url = os.getenv("WHISPER_URL", "http://whisper:9000")
-        self.notifications_url = os.getenv("NOTIFICATIONS_URL", "http://notifications:9003")
+        # Service URLs from Settings
+        self.ollama_url = settings.ollama_url
+        self.comfyui_url = settings.comfyui_url
+        self.whisper_url = settings.whisper_url
+        self.notifications_url = settings.notifications_url
         
         logger.info("🚀 Prometheus Orchestrator initialized")
 
@@ -253,9 +246,9 @@ class PrometheusOrchestrator:
             # or just rely on service names if using internal docker DNS
             
             service_map = {
-                "ollama": {"url": self.ollama_url, "vram": 6000, "container": "prometheus-ollama"},
-                "comfyui": {"url": self.comfyui_url, "vram": 8500, "container": "prometheus-comfyui"},
-                "whisper": {"url": self.whisper_url, "vram": 1500, "container": "prometheus-whisper"},
+                "ollama": {"url": self.ollama_url, "vram": settings.vram.ollama_llama3_8b, "container": "prometheus-ollama"},
+                "comfyui": {"url": self.comfyui_url, "vram": settings.vram.comfyui_sdxl, "container": "prometheus-comfyui"},
+                "whisper": {"url": self.whisper_url, "vram": settings.vram.whisper_medium, "container": "prometheus-whisper"},
             }
             
             for name, config in service_map.items():
