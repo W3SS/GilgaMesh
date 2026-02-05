@@ -23,6 +23,10 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 # Configuration
 from config.settings import settings
 
+# Ports & Adapters (Iterations 2 & 3)
+from adapters.discord_adapter import DiscordAdapter, NullNotificationAdapter
+from adapters.docker_adapter import DockerAdapter
+
 # ============================================================================
 # CONFIGURAÇÃO E LOGGING
 # ============================================================================
@@ -142,9 +146,26 @@ class PrometheusOrchestrator:
     - Healthchecks e recuperação de falhas
     """
     
-    def __init__(self):
-        self.docker_client = docker.from_env()
+    def __init__(
+        self,
+        notification_service: Optional[Any] = None,  # NotificationPort
+        container_runtime: Optional[Any] = None  # ContainerRuntimePort
+    ):
+        # Adapters (Iteration 2 & 3 - Dependency Injection)
         self.http_client = httpx.AsyncClient(timeout=30.0)
+        
+        # Notification adapter (default to Null for safety)
+        self.notification_service = notification_service or NullNotificationAdapter()
+        
+        # Container runtime adapter (default to Docker)
+        if container_runtime is None:
+            docker_client = docker.from_env()
+            self.container_runtime = DockerAdapter(docker_client)
+        else:
+            self.container_runtime = container_runtime
+        
+        # Keep docker_client reference for compatibility (will be removed in Iteration 4)
+        self.docker_client = docker.from_env() if container_runtime is None else None
         
         # Estado do sistema
         self.current_mode: ContextMode = ContextMode.TEXT_HEAVY
@@ -174,20 +195,14 @@ class PrometheusOrchestrator:
         logger.info("🚀 Prometheus Orchestrator initialized")
 
     async def notify(self, title: str, message: str, priority: str = "normal", channel: str = "discord"):
-        """Envia notificação via serviço de notificações"""
+        """Envia notificação via adapter (Iteration 2)"""
         try:
-            payload = {
-                "channel": channel,
-                "title": title,
-                "message": message,
-                "priority": priority,
-                "metadata": {
-                    "source": "orchestrator",
-                    "mode": self.current_mode,
-                    "vram_usage": self._get_current_vram_usage()
-                }
-            }
-            await self.http_client.post(f"{self.notifications_url}/notify", json=payload)
+            await self.notification_service.send(
+                title=title,
+                message=message,
+                priority=priority,  # type: ignore
+                channel=channel  # type: ignore
+            )
         except Exception as e:
             logger.warning(f"Failed to send notification: {e}")
     
