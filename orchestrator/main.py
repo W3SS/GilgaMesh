@@ -24,8 +24,17 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 from config.settings import settings
 
 # Ports & Adapters (Iterations 2 & 3)
+# Ports & Adapters (Iterations 2, 3 & 4)
 from adapters.discord_adapter import DiscordAdapter, NullNotificationAdapter
 from adapters.docker_adapter import DockerAdapter
+from adapters.ollama_adapter import OllamaAdapter
+from adapters.comfyui_adapter import ComfyUIAdapter
+
+# Domain Models (Iteration 4)
+from domain.models import (
+    Task, TaskRequest, TaskResponse, ServiceHealth,
+    TaskType, Priority, ContextMode, ServiceState
+)
 
 # ============================================================================
 # CONFIGURAÇÃO E LOGGING
@@ -47,91 +56,7 @@ QUEUE_SIZE = Gauge('prometheus_queue_size', 'Tamanho da fila de tarefas')
 # ENUMS E CONSTANTES
 # ============================================================================
 
-class ServiceState(str, Enum):
-    """Estados possíveis de cada serviço"""
-    STOPPED = "stopped"
-    STARTING = "starting"
-    READY = "ready"
-    STOPPING = "stopping"
-    ERROR = "error"
-
-class TaskType(str, Enum):
-    """Tipos de tarefas que o orquestrador processa"""
-    TEXT_GENERATION = "text"
-    IMAGE_GENERATION = "image"
-    AUDIO_GENERATION = "audio"
-    VIDEO_GENERATION = "video"
-    TRANSCRIPTION = "transcription"
-    SYSTEM_COMMAND = "system"
-
-class Priority(int, Enum):
-    """Prioridade de execução"""
-    CRITICAL = 0  # Comandos de segurança
-    HIGH = 1      # Tarefas do usuário diretas
-    MEDIUM = 2    # Gerações criativas
-    LOW = 3       # Background tasks
-
-class ContextMode(str, Enum):
-    """Modos de operação do sistema"""
-    TEXT_HEAVY = "text_heavy"      # Ollama ativo, ComfyUI standby
-    CREATIVE = "creative"           # ComfyUI ativo, Ollama standby
-    AUDIO_PROCESSING = "audio"      # Whisper/TTS ativos
-    HYBRID = "hybrid"               # Múltiplos serviços (usar com cautela)
-
-# Configuration is now loaded from config/settings.py
-# Access via: settings.vram_limits, settings.vram_total, settings.vram_safety_margin
-
-# ============================================================================
-# MODELOS DE DADOS
-# ============================================================================
-
-class TaskRequest(BaseModel):
-    """Requisição de tarefa"""
-    type: TaskType
-    prompt: str
-    priority: Priority = Priority.MEDIUM
-    parameters: Dict[str, Any] = {}
-    user_id: Optional[str] = None
-    timeout: int = 300  # segundos
-
-class TaskResponse(BaseModel):
-    """Resposta de tarefa"""
-    task_id: str
-    status: str
-    result: Optional[Any] = None
-    error: Optional[str] = None
-    execution_time: float
-    vram_used: int
-
-@dataclass
-class Task:
-    """Tarefa interna do orquestrador"""
-    id: str
-    type: TaskType
-    prompt: str
-    priority: Priority
-    parameters: Dict[str, Any]
-    created_at: datetime = field(default_factory=datetime.now)
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    result: Optional[Any] = None
-    error: Optional[str] = None
-    
-    def __lt__(self, other):
-        """Para ordenação na fila de prioridade"""
-        if self.priority != other.priority:
-            return self.priority.value < other.priority.value
-        return self.created_at < other.created_at
-
-@dataclass
-class ServiceHealth:
-    """Estado de saúde de um serviço"""
-    name: str
-    state: ServiceState
-    vram_allocated: int
-    last_used: datetime
-    error_count: int = 0
-    url: Optional[str] = None
+# Domain Models imported from domain.models (Iteration 4 - Domain Isolation)
 
 # ============================================================================
 # ORQUESTRADOR PRINCIPAL
@@ -149,7 +74,9 @@ class PrometheusOrchestrator:
     def __init__(
         self,
         notification_service: Optional[Any] = None,  # NotificationPort
-        container_runtime: Optional[Any] = None  # ContainerRuntimePort
+        container_runtime: Optional[Any] = None,  # ContainerRuntimePort
+        text_provider: Optional[Any] = None,  # AIProviderPort
+        image_provider: Optional[Any] = None   # AIProviderPort
     ):
         # Adapters (Iteration 2 & 3 - Dependency Injection)
         self.http_client = httpx.AsyncClient(timeout=30.0)
@@ -163,6 +90,10 @@ class PrometheusOrchestrator:
             self.container_runtime = DockerAdapter(docker_client)
         else:
             self.container_runtime = container_runtime
+            
+        # AI Providers (Iteration 4)
+        self.text_provider = text_provider or OllamaAdapter(http_client=self.http_client)
+        self.image_provider = image_provider or ComfyUIAdapter(http_client=self.http_client)
         
         # Keep docker_client reference for compatibility (will be removed in Iteration 4)
         self.docker_client = docker.from_env() if container_runtime is None else None
@@ -433,117 +364,65 @@ class PrometheusOrchestrator:
     # ========================================================================
     
     async def _execute_text_generation(self, task: Task) -> str:
-        """Executa geração de texto via Ollama"""
+        """Executa geração de texto via AI Provider"""
         service = self.services.get("ollama")
         if not service or service.state != ServiceState.READY:
             raise RuntimeError("Ollama service not ready")
         
-        payload = {
-            "model": task.parameters.get("model", "llama3.1:8b"),
-            "prompt": task.prompt,
-            "stream": False,
-            "options": {
-                "temperature": task.parameters.get("temperature", 0.7),
-                "num_ctx": task.parameters.get("context_length", 4096)
-            }
-        }
-        
         try:
-            response = await self.http_client.post(
-                f"{service.url}/api/generate",
-                json=payload,
-                timeout=task.parameters.get("timeout", 120)
+            return await self.text_provider.generate_text(
+                prompt=task.prompt,
+                parameters=task.parameters
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            return result.get("response", "")
-        
-        except httpx.HTTPError as e:
-            logger.error(f"Ollama request failed: {e}")
+        except Exception as e:
+            logger.error(f"Text generation failed: {e}")
             raise
-    
+
     async def _execute_image_generation(self, task: Task) -> Dict[str, Any]:
-        """Executa geração de imagem via ComfyUI"""
+        """Executa geração de imagem via AI Provider"""
         service = self.services.get("comfyui")
         if not service or service.state != ServiceState.READY:
             raise RuntimeError("ComfyUI service not ready")
         
-        # Carrega workflow template
-        workflow_path = os.path.join(os.path.dirname(__file__), "..", "ai_services", "comfyui", "workflows", "default.json")
-        if not os.path.exists(workflow_path):
-            raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
-            
-        import json
-        with open(workflow_path, "r") as f:
-            workflow_str = f.read()
-            
-        # Parâmetros padrão
-        params = {
-            "prompt": task.prompt,
-            "negative_prompt": task.parameters.get("negative_prompt", "blur, low quality"),
-            "steps": task.parameters.get("steps", 20),
-            "cfg_scale": task.parameters.get("cfg", 7.0),
-            "width": task.parameters.get("width", 512),
-            "height": task.parameters.get("height", 512),
-            "seed": task.parameters.get("seed", 42) # Fixed seed default for testing
-        }
-        
-        # Substituição simples de template ({{key}})
-        for key, value in params.items():
-            workflow_str = workflow_str.replace(f"{{{{{key}}}}}", str(value))
-            
-        workflow = json.loads(workflow_str)
-        
         try:
-            # Envia workflow para ComfyUI
-            response = await self.http_client.post(
-                f"{service.url}/prompt",
-                json={"prompt": workflow},
-                timeout=task.parameters.get("timeout", 300)
+             # Carrega workflow template
+            workflow_path = os.path.join(os.path.dirname(__file__), "..", "ai_services", "comfyui", "workflows", "default.json")
+            if os.path.exists(workflow_path):
+                 import json
+                 with open(workflow_path, "r") as f:
+                     workflow_str = f.read()
+                     
+                 # Parâmetros padrão
+                 params = {
+                     "prompt": task.prompt,
+                     "negative_prompt": task.parameters.get("negative_prompt", "blur, low quality"),
+                     "steps": task.parameters.get("steps", 20),
+                     "cfg_scale": task.parameters.get("cfg", 7.0),
+                     "width": task.parameters.get("width", 512),
+                     "height": task.parameters.get("height", 512),
+                     "seed": task.parameters.get("seed", 42)
+                 }
+                 
+                 # Substituição simples de template ({{key}})
+                 for key, value in params.items():
+                     workflow_str = workflow_str.replace(f"{{{{{key}}}}}", str(value))
+                 
+                 workflow = json.loads(workflow_str)
+            else:
+                 # Fallback: assume que o workflow veio no parâmetro "workflow"
+                 workflow = task.parameters.get("workflow", {})
+                 if not workflow:
+                     raise ValueError("Workflow not found and not provided in parameters")
+
+            return await self.image_provider.generate_image(
+                prompt=workflow,
+                parameters=task.parameters
             )
-            response.raise_for_status()
-            
-            prompt_id = response.json()["prompt_id"]
-            
-            # Aguarda conclusão (polling)
-            image_path = await self._wait_for_comfyui_result(prompt_id)
-            
-            return {
-                "prompt_id": prompt_id,
-                "image_path": image_path,
-                "workflow": workflow
-            }
-        
-        except httpx.HTTPError as e:
-            logger.error(f"ComfyUI request failed: {e}")
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
             raise
     
-    async def _wait_for_comfyui_result(self, prompt_id: str, max_wait: int = 300) -> str:
-        """Aguarda ComfyUI terminar de processar (polling)"""
-        service = self.services["comfyui"]
-        start_time = datetime.now()
-        
-        while (datetime.now() - start_time).total_seconds() < max_wait:
-            try:
-                response = await self.http_client.get(f"{service.url}/history/{prompt_id}")
-                history = response.json()
-                
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    # Procura primeira imagem gerada
-                    for node_id, node_output in outputs.items():
-                        if "images" in node_output:
-                            image_info = node_output["images"][0]
-                            return f"/output/{image_info['filename']}"
-                
-                await asyncio.sleep(2)  # Polling a cada 2s
-            
-            except Exception as e:
-                logger.warning(f"Error polling ComfyUI: {e}")
-                await asyncio.sleep(2)
-        
-        raise TimeoutError(f"ComfyUI did not complete in {max_wait}s")
+
     
     async def _execute_transcription(self, task: Task) -> str:
         """Executa transcrição de áudio via Whisper"""

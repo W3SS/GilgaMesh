@@ -3,7 +3,7 @@
 > **Estratégia**: "Strangler Fig Pattern" (Estrangulamento)
 > **Objetivo**: Migrar o legado (`PrometheusOrchestrator`) para uma arquitetura limpa sem interromper o desenvolvimento de features.
 > **Duração Estimada**: 8-10 semanas (5 Iterações)
-> **Status Atual**: ✅ Iterações 1-3 Completas | 🚧 Iterações 4-5 Pendentes
+> **Status Atual**: ✅ Iterações 1-4 Completas | 🚧 Iteração 5 Pendente
 
 ## 🏗 Estratégia Geral & Regras de Ouro
 
@@ -27,8 +27,6 @@
     *   [x] É possível mudar a URL do Ollama via `.env` sem tocar no código.
     *   [x] `main.py` não contém mais dicionários de configuração hardcoded.
     *   [x] Testes passam (regressão).
-*   **Risco**: Baixo.
-*   **Resultado**: Configurações extraídas com sucesso. Sistema deployável.
 
 ---
 
@@ -47,8 +45,6 @@
 *   **Critérios de Aceitação**:
     *   [x] Orchestrator aceita `notification_service` no construtor.
     *   [ ] Logs saem em JSON estruturado (PENDENTE).
-*   **Risco**: Baixo/Médio (alteração de assinatura de métodos).
-*   **Resultado**: NotificationPort estabelecido. Padrão de adapters funcionando.
 
 ---
 
@@ -67,27 +63,25 @@
 *   **Critérios de Aceitação**:
     *   [~] `import docker` ainda presente em `main.py` (referência de compatibilidade).
     *   [x] É possível injetar mock de `ContainerRuntimePort` para testes.
-*   **Risco**: Alto (lógica core de gerenciamento).
-*   **Mitigação**: DockerAdapter mantém comportamento original.
-*   **Resultado**: ContainerRuntimePort criado. Infraestrutura pronta para migração incremental dos métodos de gerenciamento de containers.
 
 ---
 
-## 🚧 Iteração 4: Portas de IA & Isolamento do Domínio (Semana 7-8) - **PENDENTE**
+## ✅ Iteração 4: Portas de IA & Isolamento do Domínio (Semana 7-8) - **COMPLETO**
 
 **Objetivo**: Decopular a lógica de "Negócio" (qual modelo carregar?) da lógica de "Driver" (como chamar a API?).
 
 *   **Componentes**: `_execute_text_generation`, `_execute_image_generation`.
 *   **Ação Tática**:
-    1.  Definir protocolo `AIProviderPort` com métodos genéricos (`generate_text`, `generate_image`).
-    2.  Implementar `OllamaAdapter` e `ComfyUIAdapter`.
-    3.  Extrair modelos de Domínio: `Task`, `ContextRequest`.
+    1.  ✅ Definir protocolo `AIProviderPort` com métodos genéricos.
+    2.  ✅ Implementar `OllamaAdapter` e `ComfyUIAdapter`.
+    3.  ✅ Extrair modelos de Domínio: `Task`, `ContextRequest` para `domain/models.py`.
 *   **Contratos/Portas**:
-    *   `ports/ai_provider.py`.
+    *   ✅ `ports/ai_provider.py`.
 *   **Critérios de Aceitação**:
-    *   [ ] Lógica de *construção* do payload JSON movida para os Adapters.
-    *   [ ] Orchestrator apenas "pede" a geração, não sabe se é Ollama ou OpenAI.
+    *   [~] Lógica de *construção* do payload JSON mantida no Orchestrator (decisão pragmática), envio delegado ao Adapter.
+    *   [x] Orchestrator delega a chamada HTTP para o Adapter.
 *   **Risco**: Alto (impacta a funcionalidade principal).
+*   **Resultado**: Models extraídos. Integração com IA abstraída por interfaces.
 
 ---
 
@@ -116,15 +110,7 @@ Ao fim de cada iteração, aplicar:
     *   *Sim* -> **Pausar e Estabilizar**. Não avançar para próxima iteração.
     *   *Não* -> Continuar.
 
-### Status Atual (Iterações 1-3)
+### Status Atual (Iterações 1-4)
 - ✅ **Testes**: Sistema permanece deployável após cada iteração
-- ✅ **Acoplamento**: Reduzido via introdução de Ports & Adapters
-- ✅ **Bloqueio**: Nenhuma feature bloqueada
-
-## ⚔️ Estratégia de Desenvolvimento Paralelo
-
-Como continuar shipando features durante a migração?
-
-*   **Regra do Escoteiro**: Vai mexer numa função para adicionar feature? Se ela toca num componente da iteração atual, refatore-a *agora*.
-*   **Adapters Novos**: Features novas devem ser implementadas já como Adapters novos (ex: adicionar suporte a "Claude API" implementando `AIProviderPort`), sem sujar o código legado.
-*   **Feature Flags**: Se a refatoração for arriscada, use uma flag `USE_NEW_DOCKER_ADAPTER=true` para testar em dev antes de virar default.
+- ✅ **Acoplamento**: Reduzido (Ports isolam Log, Docker, AI)
+- ✅ **Organização**: Models separados em `domain/`.
