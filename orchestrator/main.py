@@ -188,13 +188,13 @@ class PrometheusOrchestrator:
         """Descobre e registra containers Docker disponíveis"""
         try:
             # We map container names (or service names) to internal configs
-            # Assuming container names are prefixed with 'prometheus-' based on docker-compose
+            # Assuming container names are prefixed with 'gilgamesh-' based on docker-compose
             # or just rely on service names if using internal docker DNS
             
             service_map = {
-                "ollama": {"url": self.ollama_url, "vram": settings.vram.ollama_llama3_8b, "container": "prometheus-ollama"},
-                "comfyui": {"url": self.comfyui_url, "vram": settings.vram.comfyui_sdxl, "container": "prometheus-comfyui"},
-                "whisper": {"url": self.whisper_url, "vram": settings.vram.whisper_medium, "container": "prometheus-whisper"},
+                "ollama": {"url": self.ollama_url, "vram": settings.vram.ollama_llama3_8b, "container": "gilgamesh-ollama"},
+                "comfyui": {"url": self.comfyui_url, "vram": settings.vram.comfyui_sdxl, "container": "gilgamesh-comfyui"},
+                "whisper": {"url": self.whisper_url, "vram": settings.vram.whisper_medium, "container": "gilgamesh-whisper"},
             }
             
             for name, config in service_map.items():
@@ -539,7 +539,7 @@ class PrometheusOrchestrator:
         
         try:
             # Map internal service name to container name
-            container_name = f"prometheus-{service_name}"
+            container_name = f"gilgamesh-{service_name}"
             container = self.docker_client.containers.get(container_name)
             
             logger.info(f"Starting {service_name}...")
@@ -573,7 +573,7 @@ class PrometheusOrchestrator:
             return
         
         try:
-            container_name = f"prometheus-{service_name}"
+            container_name = f"gilgamesh-{service_name}"
             container = self.docker_client.containers.get(container_name)
             
             logger.info(f"Stopping {service_name}...")

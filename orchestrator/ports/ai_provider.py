@@ -2,8 +2,7 @@
 AI Provider Port - Interface for AI generation services
 """
 
-from typing import Protocol, Any, Dict, Optional
-from domain.models import Task
+from typing import Protocol, Any, Dict
 
 
 class AIProviderPort(Protocol):
