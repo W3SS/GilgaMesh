@@ -1,0 +1,91 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "H:\\Meu Drive\\codebase\\tech\\gilgamesh"
+      ],
+      "description": "Full read/write access to the Gilgamesh project tree"
+    },
+    "git": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-git",
+        "--repository",
+        "H:\\Meu Drive\\codebase\\tech\\gilgamesh"
+      ],
+      "description": "Git repository inspection — log, diff, blame, status"
+    },
+    "fetch": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch"
+      ],
+      "description": "HTTP fetch proxy — reaches Orchestrator (8005), Sentinel (8001), Grafana (3000)"
+    },
+    "orchestrator-api": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch",
+        "--base-url",
+        "http://localhost:8005"
+      ],
+      "description": "Orchestrator REST API — /health, /tasks, /services, /api/v1/system/ports",
+      "env": {
+        "MCP_FETCH_BASE_URL": "http://localhost:8005",
+        "MCP_FETCH_ALLOWED_HOSTS": "localhost"
+      }
+    },
+    "sentinel-api": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch",
+        "--base-url",
+        "http://localhost:8001"
+      ],
+      "description": "Sentinel security API — /health, /network, /processes, /suspicious",
+      "env": {
+        "MCP_FETCH_BASE_URL": "http://localhost:8001",
+        "MCP_FETCH_ALLOWED_HOSTS": "localhost"
+      }
+    },
+    "sqlite": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sqlite",
+        "--db-path",
+        "H:\\Meu Drive\\codebase\\tech\\gilgamesh\\data\\gilgamesh.db"
+      ],
+      "description": "SQLite access for task history, port scan cache, and event log (created on first run)"
+    }
+  },
+  "globalShortcuts": {
+    "health-check": {
+      "description": "Check health of all Gilgamesh services",
+      "steps": [
+        "fetch http://localhost:8005/health",
+        "fetch http://localhost:8001/health",
+        "fetch http://localhost:9093/-/healthy"
+      ]
+    },
+    "port-scan": {
+      "description": "List all open ports and flag suspicious ones",
+      "steps": [
+        "fetch http://localhost:8001/api/v1/system/ports"
+      ]
+    },
+    "services-status": {
+      "description": "Show running background services with resource usage",
+      "steps": [
+        "fetch http://localhost:8001/api/v1/system/services"
+      ]
+    }
+  }
+}

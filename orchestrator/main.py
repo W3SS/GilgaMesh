@@ -747,6 +747,18 @@ class PrometheusOrchestrator:
 app = FastAPI(title="Prometheus Orchestrator API")
 orchestrator = PrometheusOrchestrator()
 
+# System monitor adapter (Iteration 6 — Port & Service Discovery)
+from adapters.psutil_system_adapter import PsutilSystemAdapter
+from prometheus_client import Counter as _Counter
+
+_SUSPICIOUS_PORT_COUNTER = _Counter(
+    'sentinel_suspicious_port_detected_total',
+    'Suspicious open ports detected by system monitor',
+    ['port', 'process_name']
+)
+
+_system_monitor = PsutilSystemAdapter()
+
 @app.on_event("startup")
 async def startup():
     """Inicializa orquestrador ao subir API"""
@@ -803,6 +815,116 @@ async def set_mode(target_mode: ContextMode, background_tasks: BackgroundTasks):
 async def health():
     """Healthcheck da API"""
     return {"status": "healthy", "mode": orchestrator.current_mode}
+
+
+# ============================================================================
+# SYSTEM MONITOR ENDPOINTS (Iteration 6 — Port & Service Discovery)
+# ============================================================================
+
+@app.get("/api/v1/system/ports")
+async def get_open_ports():
+    """
+    Lista todas as portas TCP/UDP abertas na máquina local.
+
+    Portas suspeitas (ex: 4444, 31337, 3389) são sinalizadas com suspicious=true.
+    Resultados são cacheados por 5 segundos para minimizar overhead de CPU.
+
+    Returns:
+        JSON com lista de conexões abertas ordenadas por porta ascendente.
+    """
+    connections = await _system_monitor.get_open_ports()
+
+    # Increment Prometheus counter for each suspicious port found
+    for conn in connections:
+        if conn.suspicious:
+            _SUSPICIOUS_PORT_COUNTER.labels(
+                port=str(conn.local_port),
+                process_name=conn.process_name or "unknown"
+            ).inc()
+
+    return {
+        "count": len(connections),
+        "suspicious_count": sum(1 for c in connections if c.suspicious),
+        "ports": [
+            {
+                "local_port": c.local_port,
+                "local_address": c.local_address,
+                "remote_address": c.remote_address,
+                "protocol": c.protocol,
+                "state": c.state,
+                "pid": c.pid,
+                "process_name": c.process_name,
+                "suspicious": c.suspicious,
+            }
+            for c in connections
+        ]
+    }
+
+
+@app.get("/api/v1/system/services")
+async def get_background_services():
+    """
+    Lista todos os processos em execução com uso de CPU e memória.
+
+    Resultados são cacheados por 10 segundos.
+    Ordenados por uso de CPU decrescente.
+
+    Returns:
+        JSON com lista de serviços/processos em background.
+    """
+    services = await _system_monitor.get_background_services()
+
+    return {
+        "count": len(services),
+        "services": [
+            {
+                "pid": s.pid,
+                "name": s.name,
+                "status": s.status,
+                "cpu_percent": s.cpu_percent,
+                "memory_mb": s.memory_mb,
+                "username": s.username,
+                "create_time": s.create_time,
+            }
+            for s in services
+        ]
+    }
+
+
+@app.get("/api/v1/system/ports/{port}")
+async def check_port(port: int):
+    """
+    Verifica se uma porta específica está aberta localmente.
+
+    Args:
+        port: Número da porta (1-65535)
+
+    Returns:
+        JSON com is_open e detalhes da conexão se encontrada.
+    """
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=422, detail="Port must be between 1 and 65535")
+
+    connections = await _system_monitor.get_open_ports()
+    matches = [c for c in connections if c.local_port == port]
+
+    return {
+        "port": port,
+        "is_open": len(matches) > 0,
+        "suspicious": port in {22, 23, 3389, 4444, 5900, 6667, 31337},
+        "connections": [
+            {
+                "local_address": c.local_address,
+                "remote_address": c.remote_address,
+                "protocol": c.protocol,
+                "state": c.state,
+                "pid": c.pid,
+                "process_name": c.process_name,
+            }
+            for c in matches
+        ]
+    }
+
 
 # ============================================================================
 # ENTRY POINT
