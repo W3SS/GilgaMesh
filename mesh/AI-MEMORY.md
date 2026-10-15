@@ -8,7 +8,7 @@ de onde outra sessão parou e conseguem deixar recados uns para os outros, como 
 | Verificado (código e documentação) | Não verificado (sem acesso à tailnet) |
 | :-- | :-- |
 | `W3SS/ai-memory` commit `fc4da03` de 04/10, versão 2.5.2 (fork de `akitaonrails/ai-memory`) | O servidor real em `memory.mesh.w3ss.sh` (versão, config, usuários) |
-| Plugin `MrLuciano/ai-memory-hermes-plugin` commit `4f2028a` de 30/09 | Se o plugin do Hermes está instalado e em que perfis |
+| Plugin `MrLuciano/ai-memory-hermes-plugin` commit `4f2028a` de 30/09, e o servidor 2.5.2 compilado e testado aqui com chaves `aim_` | Se o plugin do Hermes está instalado e em que perfis |
 | O que o Status de 04/10 diz: ai-memory 2.5.2 na VPS, só tailnet, token obrigatório, backup diário de 14 dias, perfis de código ligados por MCP e hooks em modo allowlist, NANAO fora | Quais perfis são "de código" e o que a allowlist contém |
 | Testes do Caderno: MEM-01 (token) e BKP-07 (backup) passam | Qualquer teste de continuidade entre nós: **não existe** |
 
@@ -65,23 +65,37 @@ MacBook nunca consegue assumir o bastão deixado no Mac Mini.
 - Um usuário humano (`wendel`) e **uma chave `aim_` por nó** (`macmini`, `macbook`, `wsl`, `vps`),
   cada uma revogável sozinha:
   `ai-memory user add-human --username wendel ...` e `ai-memory api-key add --username wendel --label macbook`.
+  **Verificado:** um bastão criado com a chave do `macbook` apareceu e foi aceito com a chave do `macmini`
+  (mesmo usuário), não apareceu para outro usuário e, depois de aceito, não aparecia mais para ninguém.
+  Você é o único usuário do servidor hoje, então a troca não tem risco de atingir outras pessoas.
 - Não compartilhe o token root entre os 39 perfis: ele também faz tudo em `/admin`.
 - Guarde a chave em arquivo `0600` (o `install-hooks` já grava em `<data_dir>/auth-token`) ou no Keychain.
   Nunca no `config.yaml` (teste HER-08).
 - O pepper do servidor (`[auth].token_pepper`) não pode mudar depois de emitir chaves, e entra no backup de configuração.
 
-### R3. Armadilha: o plugin do Hermes quebra com chave de usuário
-O plugin chama `/admin/search`, `/admin/write-page` e `/admin/status`. Quando o servidor tem usuários,
-**todo `/admin/*` é só do root**. Com chave `aim_` essas chamadas dão 403: o Hermes perde busca e escrita,
-mas `/hook` e `/handoff` continuam funcionando, então a falha parece parcial.
+### R3. O plugin do Hermes quebrava com chave de usuário (corrigido, falta publicar)
+O plugin chamava `/admin/search`, `/admin/write-page` e `/admin/status`. Quando o servidor tem usuários,
+**todo `/admin/*` é só do root**. Com chave `aim_` essas chamadas davam 403: o Hermes perdia busca e
+escrita, mas `/hook` e `/handoff` continuavam funcionando, então a falha parecia parcial.
 
-Opções:
-- **Recomendada:** ajustar o plugin (você tem o fork em W3SS) para buscar por `GET /api/v1/search` e
-  escrever pelo MCP (`memory_write_page`). Ambos aceitam chave de usuário.
-- Provisória: usar o token root só nos gateways Hermes. Funciona, mas dá a todos os perfis poder de apagar.
-- Não criar usuários no servidor até resolver isto, se hoje tudo roda com o token único.
+**Verificado num servidor ai-memory 2.5.2 real**, compilado e rodando aqui com um usuário e chaves `aim_`:
 
-`./ai-memory-check.sh` mostra o 403 quando acontece.
+| Chamada do plugin | Antes, chave de usuário | Depois, chave de usuário | Depois, token root |
+| :-- | :-- | :-- | :-- |
+| status | 403 | OK | OK (com versão e contadores) |
+| escrever página | 403 | OK | OK |
+| buscar (global e por projeto) | 403 | OK | OK |
+| handoff | OK | OK | OK |
+
+O ajuste usa as ferramentas MCP (`memory_query`, `memory_write_page`, `memory_status`) em vez de `/admin`.
+`/api/v1` **não serve**: ele só existe quando o servidor roda com `--enable-web`. Servidores sem `/mcp`
+continuam caindo para `/admin` uma vez. Os 167 testes do plugin passam (eram 153), mais ruff e mypy.
+
+Estado do código: commit `2a2c3ea` na branch `user-level-endpoints` do clone local, e o patch completo em
+`mesh/patches/ai-memory-hermes-plugin-user-level-endpoints.patch`. **Ainda não está no GitHub:** o fork
+`W3SS/ai-memory-hermes-plugin` não existe (só existe o repositório de `MrLuciano`), e esta sessão só
+consegue enviar para repositórios já listados. Para instalar sem esperar o fork:
+`git clone https://github.com/MrLuciano/ai-memory-hermes-plugin && cd ai-memory-hermes-plugin && git am <este patch>`.
 
 ### R4. Hermes precisa de duas ligações, não de uma
 - O **plugin** cuida do ciclo da sessão (recuperar, capturar turnos, fechar sessão, entregar o handoff).
@@ -195,15 +209,29 @@ porque não há hook de fim de sessão.
 
 ## 5. Plano de execução
 
-1. **Hoje (você, Mac Mini):** `./ai-memory-check.sh` com o token do nó. Cola a saída para eu ajustar.
-2. **Decidir R3:** corrigir o plugin do Hermes no fork antes de criar usuários.
+A ordem importa: o plugin corrigido funciona com o token root **e** com chave de usuário, então ele vai
+primeiro. Só depois se troca a credencial.
+
+1. **Plugin corrigido nos nós com Hermes** (Mac Mini, MacBook, VPS, WSL). Aplicar o patch e reiniciar o
+   gateway Hermes. Testar com `hermes ai-memory status` e uma busca.
+2. **Hoje, no Mac Mini:** `./ai-memory-check.sh` com o token do nó. Cole a saída.
 3. **Marcadores:** commitar `.ai-memory.toml` nos repositórios ativos (`gilgamesh`, `iron-rail-gateway` e os de jogos).
-4. **Usuário e chaves:** `wendel` + uma chave por nó; revogar o que for token compartilhado.
-5. **Ligar cada nó:** Claude Code (`ai-memory run claude` ou `install-mcp` + `install-hooks`), Hermes (plugin + MCP) nos perfis de código.
-6. **Prova:** abrir uma sessão no MacBook, deixar um handoff, aceitar no Mac Mini (teste MEM-02). Repetir para WSL e VPS.
-7. **Auditoria:** acrescentar MEM-02 a MEM-07 ao caderno.
-8. **Promoção para o vault** com AIZEN, depois de duas semanas de uso.
-9. **Esta sessão:** opção A agora, avaliar B depois.
+4. **Usuário e chaves, no servidor (VPS):**
+   ```bash
+   ai-memory user add-human --username wendel --email <seu e-mail> --name "Wendel"
+   for n in macmini macbook wsl vps; do ai-memory api-key add --username wendel --label $n; done
+   ```
+   Cada chave aparece uma vez. Guarde cada uma só no nó dela (arquivo `0600` ou Keychain).
+   Não troque o `token_pepper` depois disso.
+5. **Trocar nó por nó:** pôr a chave do nó no lugar do token root (`install-hooks --apply --auth-token ...`
+   para os hooks do Claude Code e `AI_MEMORY_AUTH_TOKEN` no ambiente do Hermes), rodar o
+   `ai-memory-check.sh` e confirmar. Quando todos estiverem trocados, o token root fica só no servidor.
+6. **Ligar cada harness:** Claude Code (`ai-memory run claude` ou `install-mcp` + `install-hooks`), Hermes
+   (plugin + MCP) nos perfis de código.
+7. **Prova (MEM-02):** deixar um handoff no MacBook e aceitar no Mac Mini. Repetir para WSL e VPS.
+8. **Auditoria:** acrescentar MEM-02 a MEM-07 ao caderno.
+9. **Promoção para o vault** com AIZEN, depois de duas semanas de uso.
+10. **Esta sessão:** opção A agora, avaliar B depois.
 
 ## 6. Teste manual de ponta a ponta
 

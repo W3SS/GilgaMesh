@@ -26,7 +26,7 @@ if [ -n "$TOKEN" ]; then
   code="$(curl -s -m 8 -o /tmp/aim-status.$$ -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/admin/status" || true)"
   case "$code" in
     200) ok "token aceito em /admin/status"; python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("        ", json.dumps(d)[:300])' /tmp/aim-status.$$ 2>/dev/null ;;
-    403) bad "403 em /admin/*: com usuários no servidor, /admin é só do root. O plugin do Hermes usa /admin/search e /admin/write-page, então falha com chave aim_." ;;
+    403) info "403 em /admin/*: normal com chave de usuário (/admin é só do root). O plugin do Hermes precisa da versão com MCP (patches/ai-memory-hermes-plugin-user-level-endpoints.patch)." ;;
     401) bad "token recusado" ;;
     *)   bad "HTTP $code em /admin/status" ;;
   esac
