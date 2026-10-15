@@ -64,3 +64,6 @@ ai_services/whisper/cache/
 # Logs
 *.log
 sentinel.log
+
+# Mesh (overrides locais por máquina)
+mesh/local.env
