@@ -3,6 +3,12 @@
 Kit para ligar todas as máquinas da tailnet entre si (SSH por chave via Tailscale) e deixar
 o `claude remote-control` rodando em cada projeto, para coordenar tudo pelo app Claude no celular.
 
+Este kit **complementa** a arquitetura v2.x do Iron Rail (Kong na VPS, A2A nativo do Hermes,
+`mesh.yaml` no Gitea); não a substitui. Diagnóstico, histórico e procedimentos: [RUNBOOK.md](RUNBOOK.md).
+
+- `doctor.sh`: diagnóstico somente leitura (rode no Mac Mini).
+- `claude-mesh-mcp.sh`: liga o Claude Code do nó aos MCPs da malha pelo Kong.
+
 ## Nodes (`nodes.conf`)
 
 | Alias | Máquina | IP Tailscale | SO | Script |
@@ -10,14 +16,15 @@ o `claude remote-control` rodando em cada projeto, para coordenar tudo pelo app 
 | phone | poco-x7-pro | 100.114.188.55 | Android | — (só cliente, ver abaixo) |
 | wsl | creative-wsl | 100.104.74.53 | Linux (WSL) | `bootstrap-linux.sh` |
 | desktop | desktop-p765rni | 100.85.202.56 | Windows | `bootstrap-windows.ps1` |
-| florence | florence | 100.120.199.60 | **Linux (suposto)** | `bootstrap-linux.sh` |
-| gateway | iron-gateway | 100.89.141.115 | **Linux (suposto)**, offline no print | `bootstrap-linux.sh` |
+| florence | florence | 100.120.199.60 | **não identificado** | nenhum até identificar |
+| gateway | iron-gateway | 100.89.141.115 | **fantasma** (remover do tailnet) | nenhum |
 | macmini | mac-mini-de-wendel | 100.115.122.50 | macOS | `bootstrap-macos.sh` |
 | vps1 | srv1819753 | 100.118.63.44 | Linux (VPS) | `bootstrap-linux.sh` |
 | macbook | wendels-macbook-air | 100.89.49.96 | macOS | `bootstrap-macos.sh` |
 
-Ajuste a coluna `os` de `florence`/`iron-gateway` se não forem Linux, e preencha `ssh_user`
-nas máquinas em que o usuário de login for diferente.
+`florence` e `iron-gateway` ficam fora da config SSH (`os` = `unknown`/`retired`) até você
+identificar o primeiro e remover o segundo. Preencha `ssh_user` onde o login for diferente.
+As chaves autorizadas levam `from="100.64.0.0/10"`, como pedem os testes SEC-04/SEC-10.
 
 ## Passo a passo
 

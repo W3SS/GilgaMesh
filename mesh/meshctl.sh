@@ -15,7 +15,7 @@ targets() { # imprime "alias" dos nodes alcançáveis por SSH, exceto esta máqu
   local name alias ip os user
   while IFS='|' read -r name alias ip os user; do
     [ "$name" = "$SELF" ] && continue
-    [ "$os" = "android" ] && continue
+    is_ssh_target "$os" || continue
     echo "$alias"
   done < <(nodes)
 }

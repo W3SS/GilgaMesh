@@ -93,7 +93,7 @@ if ($null -eq $text) { $text = '' }
 $text = [regex]::Replace($text, "(?s)$([regex]::Escape($Begin)).*?$([regex]::Escape($End))\r?\n?", '')
 $block = "$Begin`n# Gerado por mesh/ - edite nodes.conf, nao este bloco.`n"
 foreach ($n in $nodes) {
-  if ($n.Name -eq $self.Name -or $n.Os -eq 'android') { continue }
+  if ($n.Name -eq $self.Name -or $n.Os -notin @('macos','linux','windows')) { continue }
   $hosts = if ($n.Alias -eq $n.Name) { $n.Name } else { "$($n.Alias) $($n.Name)" }
   $block += "Host $hosts`n  HostName $($n.Ip)`n"
   if ($n.User) { $block += "  User $($n.User)`n" }
@@ -113,7 +113,8 @@ $existing = @(Get-Content $akPath -ErrorAction SilentlyContinue)
 $added = 0
 foreach ($f in Get-ChildItem $PubDir -Filter *.pub -ErrorAction SilentlyContinue) {
   $k = (Get-Content $f.FullName -Raw).Trim()
-  if ($k -and ($existing -notcontains $k)) { Add-Content -Path $akPath -Value $k -Encoding ascii; $added++ }
+  # from= igual ao teste SEC-10: a chave só vale vinda da tailnet
+  if ($k -and -not ($existing | Where-Object { $_ -like "*$k*" })) { Add-Content -Path $akPath -Value "from=`"100.64.0.0/10`" $k" -Encoding ascii; $added++ }
 }
 if ($isAdminUser) {
   icacls.exe $akPath /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
