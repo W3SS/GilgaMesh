@@ -8,6 +8,7 @@ Este kit **complementa** a arquitetura v2.x do Iron Rail (Kong na VPS, A2A nativ
 
 - `doctor.sh`: diagnóstico somente leitura (rode no Mac Mini).
 - `claude-mesh-mcp.sh`: liga o Claude Code do nó aos MCPs da malha pelo Kong.
+- `ai-memory-check.sh`: verifica a integração com o ai-memory neste nó (somente leitura). Análise e requisitos: [AI-MEMORY.md](AI-MEMORY.md).
 
 ## Nodes (`nodes.conf`)
 
