@@ -62,9 +62,13 @@ O `mesh.yaml` deve passar a ser o registro de quais `workspace/project` existem.
 Handoffs são **do usuário que os criou**. Se cada nó entrar com um usuário diferente, a sessão do
 MacBook nunca consegue assumir o bastão deixado no Mac Mini.
 
-- Um usuário humano (`wendel`) e **uma chave `aim_` por nó** (`macmini`, `macbook`, `wsl`, `vps`),
-  cada uma revogável sozinha:
-  `ai-memory user add-human --username wendel ...` e `ai-memory api-key add --username wendel --label macbook`.
+- Um usuário (`wendel`) e **uma chave `aim_` por nó** (`macmini`, `macbook`, `wsl`, `vps`),
+  cada uma revogável sozinha. Crie o usuário com `ai-memory user add` (token-only) e **não** com
+  `user add-human`: o `add-human` liga o login humano e, a partir daí, **o servidor se recusa a reiniciar**
+  sem um root com senha ou um `AI_MEMORY_AUTH__RECOVERY_TOKEN`. Foi o que aconteceu no teste aqui: o
+  servidor caiu no primeiro restart. Uma atualização de contêiner ou um reboot da VPS derrubaria a memória
+  de todos os nós. O `user add` também emite um token legado que funciona como bearer; ele precisa ser revogado.
+  O script `ai-memory-provision.sh` faz tudo isso.
   **Verificado:** um bastão criado com a chave do `macbook` apareceu e foi aceito com a chave do `macmini`
   (mesmo usuário), não apareceu para outro usuário e, depois de aceito, não aparecia mais para ninguém.
   Você é o único usuário do servidor hoje, então a troca não tem risco de atingir outras pessoas.
@@ -216,16 +220,27 @@ primeiro. Só depois se troca a credencial.
    gateway Hermes. Testar com `hermes ai-memory status` e uma busca.
 2. **Hoje, no Mac Mini:** `./ai-memory-check.sh` com o token do nó. Cole a saída.
 3. **Marcadores:** commitar `.ai-memory.toml` nos repositórios ativos (`gilgamesh`, `iron-rail-gateway` e os de jogos).
-4. **Usuário e chaves, no servidor (VPS):**
+4. **Usuário e chaves, no servidor (VPS), com o script:**
    ```bash
-   ai-memory user add-human --username wendel --email <seu e-mail> --name "Wendel"
-   for n in macmini macbook wsl vps; do ai-memory api-key add --username wendel --label $n; done
+   AI_MEMORY_AUTH_TOKEN=<token root> ./ai-memory-provision.sh           # mostra o plano
+   AI_MEMORY_AUTH_TOKEN=<token root> ./ai-memory-provision.sh --apply   # cria
    ```
-   Cada chave aparece uma vez. Guarde cada uma só no nó dela (arquivo `0600` ou Keychain).
+   Cria `wendel` (token-only), revoga o token legado e grava uma chave por nó em `~/ai-memory-keys/<nó>.key`
+   (0600, nunca impressa). É idempotente: rodar de novo não duplica nada. Servidor em Docker:
+   `AI_MEMORY_BIN="docker exec -i -e AI_MEMORY_AUTH_TOKEN ai-memory ai-memory"`.
    Não troque o `token_pepper` depois disso.
-5. **Trocar nó por nó:** pôr a chave do nó no lugar do token root (`install-hooks --apply --auth-token ...`
-   para os hooks do Claude Code e `AI_MEMORY_AUTH_TOKEN` no ambiente do Hermes), rodar o
-   `ai-memory-check.sh` e confirmar. Quando todos estiverem trocados, o token root fica só no servidor.
+5. **Trocar nó por nó, com o script:**
+   ```bash
+   ./ai-memory-switch.sh macbook --key-from-ssh vps1:~/ai-memory-keys/macbook.key --hermes-set          # plano
+   ./ai-memory-switch.sh macbook --key-from-ssh vps1:~/ai-memory-keys/macbook.key --hermes-set --apply --delete-remote
+   ```
+   Antes de mexer em qualquer coisa ele confirma no servidor que a chave é de usuário. Depois grava
+   `auth-token` e `auth-header`, troca o token root antigo onde ele aparece escrito nos clientes
+   (`~/.claude.json`, `~/.claude/settings.json`, `.env` e `config.yaml` dos perfis Hermes, LaunchAgents,
+   units systemd de usuário), verifica de novo, apaga a chave da VPS e lista o que reiniciar. As cópias de
+   segurança (que contêm o token root antigo) ficam em `<data_dir>/.switch-backup-<hora>`: apague-as quando
+   tudo estiver funcionando. Faça um nó, rode `./ai-memory-check.sh` e só então o próximo. Quando todos
+   estiverem trocados, o token root fica só no servidor.
 6. **Ligar cada harness:** Claude Code (`ai-memory run claude` ou `install-mcp` + `install-hooks`), Hermes
    (plugin + MCP) nos perfis de código.
 7. **Prova (MEM-02):** deixar um handoff no MacBook e aceitar no Mac Mini. Repetir para WSL e VPS.
